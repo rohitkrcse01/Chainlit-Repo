@@ -1,0 +1,290 @@
+# mongodb_data_layer.py
+# Chainlit <-> MongoDB data layer with:
+# - Robust thread ID handling (supports "id" and Mongo "_id")
+# - JSON-safe encoding for datetime/ObjectId
+# - Paginated response object that exposes .to_dict() (to satisfy Chainlit server)
+
+import datetime
+import uuid
+from typing import Dict, List, Optional, Any
+
+import chainlit as cl
+from chainlit.data.base import BaseDataLayer
+import motor.motor_asyncio as motor
+from dataclasses import asdict
+
+# Optional bson import for ObjectId conversion
+try:
+    from bson import ObjectId  # type: ignore
+except Exception:  # pragma: no cover
+    class ObjectId:  # type: ignore
+        pass
+
+# Expose `id` on cl.User using the Mongo _id if present
+setattr(cl.User, "id", property(lambda self: self.metadata.get("_id", self.identifier)))
+
+def _now() -> datetime.datetime:
+    return datetime.datetime.utcnow()
+
+def _encode_value(v):
+    if isinstance(v, datetime.datetime):
+        # ISO 8601; Chainlit/FastAPI can serialize this easily
+        return v.isoformat()
+    # Handle ObjectId without hard dependency on bson
+    try:
+        if isinstance(v, ObjectId):
+            return str(v)
+    except Exception:
+        pass
+    if isinstance(v, dict):
+        return {k: _encode_value(val) for k, val in v.items()}
+    if isinstance(v, list):
+        return [_encode_value(x) for x in v]
+    return v
+
+def _encode_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
+    return _encode_value(doc)
+
+class CLPaginatedResponse:
+    """Minimal response object with .to_dict() to match Chainlit server expectations."""
+    def __init__(self, data: List[Dict[str, Any]], total: int, page: int, size: int):
+        self.data = data
+        self.total = total
+        self.pageInfo = {"page": page, "size": size, "total": total}
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"data": self.data, "total": self.total, "pageInfo": self.pageInfo}
+
+class MongoDataLayer(BaseDataLayer):
+    def __init__(self, uri: str, db_name: str):
+        self.client = motor.AsyncIOMotorClient(uri)
+        self.db = self.client[db_name]
+        self.col_users = self.db["users"]
+        self.col_threads = self.db["threads"]
+        self.col_steps = self.db["steps"]
+        self.col_elements = self.db["elements"]
+        self.col_feedback = self.db["feedback"]
+        self.col_sessions = self.db["sessions"]
+
+    # Required by BaseDataLayer
+    def build_debug_url(self, thread_id: str) -> str:
+        # Placeholder; update if you host a custom debug page
+        return f"mongodb://debug/thread/{thread_id}"
+
+    # --- Users ---
+    async def get_user(self, identifier: str):
+        doc = await self.col_users.find_one({"identifier": identifier})
+        if not doc:
+            return None
+        return cl.User(
+            identifier=doc["identifier"],
+            metadata={**doc.get("metadata", {}), "_id": str(doc.get("_id"))},
+        )
+
+    async def create_user(self, user: cl.User):
+        payload = {
+            "identifier": user.identifier,
+            "metadata": user.metadata or {},
+            "created_at": _now(),
+        }
+        await self.col_users.update_one(
+            {"identifier": user.identifier},
+            {"$setOnInsert": payload},
+            upsert=True,
+        )
+        doc = await self.col_users.find_one({"identifier": user.identifier})
+        return cl.User(
+            identifier=user.identifier,
+            metadata={**(user.metadata or {}), "_id": str(doc.get("_id"))},
+        )
+
+    async def delete_user_session(self, id: str) -> bool:
+        await self.col_sessions.delete_one({"_id": id})
+        return True
+
+    # --- Feedback ---
+    async def upsert_feedback(self, feedback):
+        fid = getattr(feedback, "id", None) or str(uuid.uuid4())
+        doc = asdict(feedback)
+        doc["id"] = fid
+        doc["updated_at"] = _now()
+        await self.col_feedback.update_one({"id": fid}, {"$set": doc}, upsert=True)
+        return fid
+
+    async def delete_feedback(self, feedback_id: str) -> bool:
+        res = await self.col_feedback.delete_one({"id": feedback_id})
+        return res.deleted_count == 1
+
+    # --- Elements (only store metadata; store file path/URL in "url" if needed) ---
+    async def create_element(self, element_dict: dict):
+        if "id" not in element_dict:
+            element_dict["id"] = str(uuid.uuid4())
+        element_dict["created_at"] = _now()
+        await self.col_elements.insert_one(element_dict)
+        return element_dict["id"]
+
+    async def get_element(self, thread_id: str, element_id: str):
+        doc = await self.col_elements.find_one({"id": element_id, "thread_id": thread_id})
+        return _encode_doc(doc) if doc else None
+
+    async def delete_element(self, element_id: str):
+        await self.col_elements.delete_one({"id": element_id})
+
+    # --- Steps (messages) ---
+    async def create_step(self, step_dict: dict):
+        if "id" not in step_dict:
+            step_dict["id"] = str(uuid.uuid4())
+        # store as datetime for sorting; Chainlit handles serialization
+        if not step_dict.get("created_at"):
+            step_dict["created_at"] = _now()
+        await self.col_steps.insert_one(step_dict)
+
+        # ensure thread exists & update timestamps
+        tid = step_dict.get("thread_id")
+        if tid:
+            await self.col_threads.update_one(
+                {"id": tid},
+                {
+                    "$setOnInsert": {"id": tid, "created_at": _now()},
+                    "$set": {"updated_at": _now()},
+                },
+                upsert=True,
+            )
+        return step_dict["id"]
+
+    async def update_step(self, step_dict: dict):
+        await self.col_steps.update_one({"id": step_dict["id"]}, {"$set": step_dict})
+
+    async def delete_step(self, step_id: str):
+        await self.col_steps.delete_one({"id": step_id})
+
+    # --- Threads ---
+    async def get_thread_author(self, thread_id: str):
+        t = await self.col_threads.find_one({"id": thread_id}, {"user_id": 1})
+        return t.get("user_id") if t else None
+
+    async def delete_thread(self, thread_id: str):
+        # Delete by custom "id" or fallback to _id
+        res = await self.col_threads.delete_one({"id": thread_id})
+        if res.deleted_count == 0:
+            try:
+                _obj = ObjectId(thread_id)  # type: ignore
+                await self.col_threads.delete_one({"_id": _obj})
+            except Exception:
+                pass
+        # Delete steps/elements that reference this thread_id
+        await self.col_steps.delete_many({"thread_id": {"$in": [thread_id]}})
+        await self.col_elements.delete_many({"thread_id": {"$in": [thread_id]}})
+        return True
+
+    async def list_threads(self, pagination, filters):
+        # Build query from filters if provided
+        query: Dict[str, Any] = {}
+        if getattr(filters, "user_id", None):
+            query["user_id"] = filters.user_id
+        if getattr(filters, "search", None):
+            query["name"] = {"$regex": filters.search, "$options": "i"}
+        if getattr(filters, "tags", None):
+            query["tags"] = {"$all": list(filters.tags)}
+
+        # Resolve pagination across Chainlit versions
+        skip = 0
+        limit = 20
+        if pagination is not None:
+            if hasattr(pagination, "offset") and pagination.offset is not None:
+                skip = int(pagination.offset) or 0
+            if hasattr(pagination, "first") and pagination.first is not None:
+                limit = int(pagination.first) or limit
+            if hasattr(pagination, "page") and hasattr(pagination, "size") and pagination.page and pagination.size:
+                page = int(pagination.page) or 1
+                size = int(pagination.size) or limit
+                skip = (page - 1) * size
+                limit = size
+            if hasattr(pagination, "limit") and pagination.limit is not None:
+                limit = int(pagination.limit) or limit
+
+        total = await self.col_threads.count_documents(query)
+        cursor = (
+            self.col_threads.find(query)
+            .sort("updated_at", -1)
+            .limit(0 if limit is None else int(limit))
+            .skip(0 if skip is None else int(skip))
+        )
+        raw_items: List[Dict[str, Any]] = await cursor.to_list(length=limit or 50)
+
+        items: List[Dict[str, Any]] = []
+        for it in raw_items:
+            # Normalize id for Chainlit
+            if "id" not in it and it.get("_id") is not None:
+                it["id"] = str(it["_id"])
+            # Ensure required fields
+            it.setdefault("name", "Untitled")
+            it.setdefault("created_at", _now())
+            it.setdefault("updated_at", _now())
+            items.append(_encode_doc(it))
+
+        # Compute current page number
+        page_number = (skip // limit + 1) if limit else 1
+
+        return CLPaginatedResponse(
+            data=items,
+            total=total,
+            page=page_number,
+            size=limit or len(items),
+        )
+
+    async def get_thread(self, thread_id: str):
+        # Try by custom "id"
+        t = await self.col_threads.find_one({"id": thread_id})
+        # Fallback: try by Mongo _id if thread_id looks like one
+        if not t:
+            try:
+                _obj = ObjectId(thread_id)  # type: ignore
+                t = await self.col_threads.find_one({"_id": _obj})
+                if t and "id" not in t:
+                    t["id"] = str(t.get("_id"))
+            except Exception:
+                t = None
+        if not t:
+            return None
+
+        # Collect steps for either id/_id string reference
+        thread_ids_to_match = [thread_id]
+        if t.get("_id"):
+            thread_ids_to_match.append(str(t["_id"]))
+
+        steps_cursor = self.col_steps.find(
+            {"thread_id": {"$in": thread_ids_to_match}}
+        ).sort("created_at", 1)
+        steps = [_encode_doc(s) async for s in steps_cursor]
+
+        t["steps"] = steps
+
+        # JSON-safe thread doc with required fields
+        t.setdefault("name", "Untitled")
+        t.setdefault("created_at", _now())
+        t.setdefault("updated_at", _now())
+        if "id" not in t and t.get("_id"):
+            t["id"] = str(t["_id"])
+
+        return _encode_doc(t)
+
+    async def update_thread(
+        self,
+        thread_id: str,
+        name: Optional[str] = None,
+        user_id: Optional[str] = None,
+        metadata: Optional[Dict] = None,
+        tags: Optional[List[str]] = None,
+    ):
+        patch: Dict[str, Any] = {"updated_at": _now()}
+        if name is not None:
+            patch["name"] = name
+        if user_id is not None:
+            patch["user_id"] = user_id
+        if metadata is not None:
+            patch["metadata"] = metadata
+        if tags is not None:
+            patch["tags"] = tags
+        await self.col_threads.update_one({"id": thread_id}, {"$set": patch}, upsert=True)
+        return True
