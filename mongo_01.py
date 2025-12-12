@@ -19,10 +19,7 @@ setattr(cl.User, "id", property(lambda self: self.metadata.get("_id", self.ident
 # Helpers
 # --------------------------
 def _now() -> datetime.datetime:
-    """
-    Keep your existing behavior: IST (UTC+5:30).
-    Best practice is UTC, but changing it might break your existing data semantics.
-    """
+    # IST (UTC+5:30) – keeping your behavior
     return datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)
 
 
@@ -54,7 +51,7 @@ def _safe_objectid(value: Any) -> Optional[ObjectId]:
 
 def _get_chainlit_user_identifier() -> Optional[str]:
     """
-    Best-effort: resolve current logged-in user identifier from Chainlit.
+    Best-effort resolve current Chainlit user identifier.
     Safe for FastAPI/non-Chainlit contexts too.
     """
     try:
@@ -83,9 +80,6 @@ def _normalize_thread_id(d: Dict[str, Any]) -> Optional[str]:
 
 
 def _pagination_skip_limit(pagination) -> Tuple[int, int]:
-    """
-    Supports Chainlit pagination object variants: offset/first OR page/size OR limit.
-    """
     skip = 0
     limit = 20
 
@@ -115,17 +109,6 @@ def _pagination_skip_limit(pagination) -> Tuple[int, int]:
     return skip, limit
 
 
-def _paginated_response(data: List[Dict[str, Any]], total: int, page: int, size: int) -> Dict[str, Any]:
-    """
-    Chainlit-compatible response shape.
-    """
-    return {
-        "data": data,
-        "total": total,
-        "pageInfo": {"page": page, "size": size, "total": total},
-    }
-
-
 def _prepare_thread_item(it: Dict[str, Any]) -> Dict[str, Any]:
     if "id" not in it and it.get("_id"):
         it["id"] = str(it["_id"])
@@ -142,12 +125,11 @@ def _prepare_thread_item(it: Dict[str, Any]) -> Dict[str, Any]:
 
 def _is_user_step(step_dict: Dict[str, Any]) -> bool:
     """
-    Decide if this step is the USER starting to chat.
-
-    Supports:
-    - type == 'user_message'
+    Thread should be created ONLY when user starts chatting.
+    Accepts user steps by:
     - role == 'user'
-    - type == 'message' AND role == 'user'
+    - type == 'user_message'
+    - type == 'message' and role == 'user'
     """
     t = (step_dict.get("type") or "").lower()
     role = (step_dict.get("role") or "").lower()
@@ -160,6 +142,19 @@ def _is_user_step(step_dict: Dict[str, Any]) -> bool:
         return True
 
     return False
+
+
+# --------------------------
+# Chainlit expects .to_dict() for pagination
+# --------------------------
+class CLPaginatedResponse:
+    def __init__(self, data: List[Dict[str, Any]], total: int, page: int, size: int):
+        self.data = data
+        self.total = total
+        self.page_info = {"page": page, "size": size, "total": total}
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"data": self.data, "total": self.total, "pageInfo": self.page_info}
 
 
 # --------------------------
@@ -227,9 +222,6 @@ class MongoDataLayer(BaseDataLayer):
 
     # ---------------- Sessions ----------------
     async def delete_user_session(self, id: str) -> bool:
-        """
-        Deletes session by Mongo _id (ObjectId) OR by string _id.
-        """
         oid = _safe_objectid(id)
         res = await self.col_sessions.delete_one({"_id": oid if oid else id})
         return res.deleted_count == 1
@@ -278,7 +270,7 @@ class MongoDataLayer(BaseDataLayer):
         if step_dict.get("userIdentifier"):
             step_dict["userIdentifier"] = _norm_identifier(step_dict["userIdentifier"])
 
-        # Normalize thread id field
+        # Normalize threadId
         tid = _normalize_thread_id(step_dict)
 
         # Ensure id + created_at
@@ -286,48 +278,40 @@ class MongoDataLayer(BaseDataLayer):
             step_dict["id"] = str(uuid.uuid4())
         step_dict.setdefault("created_at", _now())
 
-        # Persist step (always)
+        # Persist step always
         await self.col_steps.update_one(
             {"id": step_dict["id"]},
             {"$set": step_dict},
             upsert=True,
         )
 
-        # ✅ Thread is created ONLY when user starts chatting
-        if not tid:
-            return step_dict["id"]
+        # ✅ Create thread ONLY when user starts chatting
+        if tid and _is_user_step(step_dict):
+            user_identifier = step_dict.get("userIdentifier") or _get_chainlit_user_identifier()
+            user_identifier = _norm_identifier(user_identifier)
 
-        if not _is_user_step(step_dict):
-            return step_dict["id"]
+            patch: Dict[str, Any] = {
+                "$setOnInsert": {"id": tid, "created_at": _now()},
+                "$set": {"updated_at": _now()},
+            }
 
-        # Resolve user identifier for ownership
-        user_identifier = step_dict.get("userIdentifier") or _get_chainlit_user_identifier()
-        user_identifier = _norm_identifier(user_identifier)
+            if user_identifier:
+                patch["$set"]["userIdentifier"] = user_identifier
 
-        patch: Dict[str, Any] = {
-            "$setOnInsert": {"id": tid, "created_at": _now()},
-            "$set": {"updated_at": _now()},
-        }
+            if step_dict.get("chat_profile"):
+                patch["$set"]["chat_profile"] = step_dict["chat_profile"]
 
-        if user_identifier:
-            patch["$set"]["userIdentifier"] = user_identifier
+            if step_dict.get("user_id"):
+                patch["$set"]["user_id"] = step_dict["user_id"]
 
-        # Optional: attach chat profile
-        if step_dict.get("chat_profile"):
-            patch["$set"]["chat_profile"] = step_dict["chat_profile"]
+            await self.col_threads.update_one({"id": tid}, patch, upsert=True)
 
-        # Optional legacy: user_id
-        if step_dict.get("user_id"):
-            patch["$set"]["user_id"] = step_dict["user_id"]
-
-        await self.col_threads.update_one({"id": tid}, patch, upsert=True)
         return step_dict["id"]
 
     async def update_step(self, step_dict: Dict[str, Any]):
         if step_dict.get("userIdentifier"):
             step_dict["userIdentifier"] = _norm_identifier(step_dict["userIdentifier"])
         _normalize_thread_id(step_dict)
-
         await self.col_steps.update_one({"id": step_dict["id"]}, {"$set": step_dict})
         return True
 
@@ -343,16 +327,15 @@ class MongoDataLayer(BaseDataLayer):
 
     async def list_threads(self, pagination, filters):
         """
-        Thread listing is per-user. Supports:
-        - filters.userId = Mongo user _id (ObjectId string)
-        - filters.userId = identifier (fallback)
+        IMPORTANT: Must return an object with .to_dict().
         """
         user_id = getattr(filters, "userId", None)
         chat_profile = getattr(filters, "chat_profile", None)
 
         if not user_id:
-            return _paginated_response([], 0, 1, 0)
+            return CLPaginatedResponse(data=[], total=0, page=1, size=0)
 
+        # Resolve user doc
         user_doc = None
         oid = _safe_objectid(str(user_id))
         if oid:
@@ -361,7 +344,7 @@ class MongoDataLayer(BaseDataLayer):
             user_doc = await self.col_users.find_one({"identifier": _norm_identifier(str(user_id))})
 
         if not user_doc:
-            return _paginated_response([], 0, 1, 0)
+            return CLPaginatedResponse(data=[], total=0, page=1, size=0)
 
         query: Dict[str, Any] = {"userIdentifier": user_doc.get("identifier")}
         if chat_profile:
@@ -376,20 +359,15 @@ class MongoDataLayer(BaseDataLayer):
             .skip(skip)
             .limit(limit)
         )
-
         raw_items = await cursor.to_list(length=limit)
         items = [_prepare_thread_item(it) for it in raw_items]
 
         page_number = (skip // limit + 1) if limit else 1
-        return _paginated_response(items, total, page_number, limit or len(items))
+        return CLPaginatedResponse(data=items, total=total, page=page_number, size=limit or len(items))
 
     async def get_thread(self, thread_id: str):
-        """
-        Return thread + steps in chronological order.
-        """
         t = await self.col_threads.find_one({"id": thread_id})
         if not t:
-            # fallback: allow Mongo _id access if caller passes it
             oid = _safe_objectid(thread_id)
             if oid:
                 t = await self.col_threads.find_one({"_id": oid})
@@ -399,11 +377,10 @@ class MongoDataLayer(BaseDataLayer):
         if not t:
             return None
 
-        # Steps ordered by created_at
+        # Steps ordered
         steps_cursor = self.col_steps.find({"threadId": thread_id}).sort("created_at", 1)
         steps = [_encode_doc(s) async for s in steps_cursor]
 
-        # legacy fallback
         if not steps:
             legacy_cursor = self.col_steps.find({"thread_id": thread_id}).sort("created_at", 1)
             steps = [_encode_doc(s) async for s in legacy_cursor]
@@ -447,11 +424,7 @@ class MongoDataLayer(BaseDataLayer):
         return True
 
     async def delete_thread(self, thread_id: str):
-        """
-        Delete thread + all associated steps/elements/feedback.
-        Also deletes feedback by step ids (forId) if present.
-        """
-        # Collect step ids before deleting steps (for feedback cleanup)
+        # Collect step ids before deleting steps (for feedback cleanup by forId)
         step_ids: List[str] = []
 
         cur = self.col_steps.find({"threadId": thread_id}, {"id": 1})
@@ -475,7 +448,7 @@ class MongoDataLayer(BaseDataLayer):
         await self.col_elements.delete_many({"threadId": thread_id})
         await self.col_elements.delete_many({"thread_id": thread_id})
 
-        # Delete feedback (by thread + by step ids)
+        # Delete feedback
         await self.col_feedback.delete_many({"threadId": thread_id})
         if step_ids:
             await self.col_feedback.delete_many({"forId": {"$in": step_ids}})
