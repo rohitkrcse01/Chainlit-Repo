@@ -37,21 +37,3 @@ def auth_callback(username: str, password: str):
             metadata={**(doc.get("metadata") or {}), "_id": str(doc["_id"])}
         )
     return None
-
-
-# --- Minimal bot so you can test history ---
-@cl.on_message
-async def on_message(msg: cl.Message):
-    await cl.Message(f"Echo: {msg.content}").send()
-
-from chainlit import AskUserMessage, Message, on_chat_start
-
-
-# @on_chat_start
-# async def main():
-#     res = await AskUserMessage(content="What is your name?", timeout=30).send()
-#     if res:
-#         await Message(
-#             content=f"Your name is: {res['output']}.\nChainlit installation is working!\nYou can now start building your own chainlit apps!",
-#         ).send()
-
