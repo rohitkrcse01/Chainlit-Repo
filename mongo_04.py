@@ -101,7 +101,6 @@ class MongoDataLayer(BaseDataLayer):
     async def ensure_indexes(self) -> None:
         """
         Optional: Call once at startup.
-        Sessions removed as requested.
         """
         await self.col_users.create_index("identifier", unique=True)
         await self.col_threads.create_index([("userIdentifier", 1), ("updated_at", -1)])
@@ -184,18 +183,54 @@ class MongoDataLayer(BaseDataLayer):
         )
         return element["id"]
 
+    async def get_element(self, element_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetch a single element by its id.
+        Useful if your UI wants to open/download a stored attachment.
+        """
+        doc = await self.col_elements.find_one({"id": element_id})
+        return _encode_doc(doc)
+
+    async def get_elements(
+        self,
+        thread_id: Optional[str] = None,
+        step_id: Optional[str] = None,
+        pagination: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch elements by threadId and/or stepId.
+
+        - If thread_id is provided: returns elements for that thread.
+        - If step_id is provided: returns elements for that step.
+        - If both provided: returns elements matching both.
+        - Pagination supported if you pass an object with offset/first or page/size.
+        """
+        query: Dict[str, Any] = {}
+
+        if thread_id:
+            query["threadId"] = thread_id
+        if step_id:
+            # Chainlit commonly uses forId for linking element to step
+            # but some apps store stepId directly. We support both.
+            query["$or"] = [{"forId": step_id}, {"stepId": step_id}]
+
+        skip, limit = self._calculate_pagination(pagination) if pagination else (0, 500)
+
+        cursor = (
+            self.col_elements.find(query)
+            .sort("created_at", 1)
+            .skip(skip)
+            .limit(limit)
+        )
+
+        docs = await cursor.to_list(length=limit)
+        return [_encode_doc(d) for d in docs]
+
     async def delete_element(self, element_id: str) -> bool:
         res = await self.col_elements.delete_one({"id": element_id})
         return res.deleted_count == 1
 
     # ---------------- Steps (messages) ----------------
-    # Using create_step logic aligned with your screenshots:
-    # - Insert step
-    # - Only create/update thread on USER message types ("user_message" or "message")
-    # - Normalize threadId field to "threadId"
-    # - Store userIdentifier lowercased, try to resolve from Chainlit context if missing
-    # - Store chat_profile on thread if present
-    # - Keep thread.updated_at updated on user messages
 
     async def create_step(self, step_dict: Dict[str, Any]) -> str:
         logger.info(f"Creating step - step_dict={step_dict}")
@@ -241,7 +276,7 @@ class MongoDataLayer(BaseDataLayer):
         await self.col_steps.update_one({"id": step["id"]}, {"$set": {"threadId": tid}})
 
         patch: Dict[str, Any] = {
-            "$setOnInsert": {"id": tid, "created_at": _now()},
+            "$setOnInsert": {"id": tid, "created_at": _now(), "name": "Untitled"},
             "$set": {"updated_at": _now()},
         }
 
@@ -266,10 +301,6 @@ class MongoDataLayer(BaseDataLayer):
         # Persist chat_profile if present on step (optional)
         if step.get("chat_profile"):
             patch["$set"]["chat_profile"] = step["chat_profile"]
-
-        # IMPORTANT: do not overwrite name with userIdentifier.
-        # Keep thread name stable; default to "Untitled" on insert only.
-        patch["$setOnInsert"]["name"] = "Untitled"
 
         await self.col_threads.update_one({"id": tid}, patch, upsert=True)
         logger.info(f"Thread created/updated for user message - tid={tid}")
@@ -311,8 +342,6 @@ class MongoDataLayer(BaseDataLayer):
           - elements
           - feedback
           - thread itself
-
-        This matches your React UI delete requirement.
         """
         # Gather step ids to delete feedback by forId
         step_ids: List[str] = []
@@ -379,8 +408,6 @@ class MongoDataLayer(BaseDataLayer):
 
     def _prepare_thread_item(self, it: Dict[str, Any]) -> Dict[str, Any]:
         it = dict(it)
-
-        # Ensure thread name exists and NEVER replace it with userIdentifier.
         it.setdefault("name", "Untitled")
         it.setdefault("created_at", _now())
         it.setdefault("updated_at", _now())
@@ -394,12 +421,6 @@ class MongoDataLayer(BaseDataLayer):
         return _encode_doc(it)
 
     async def list_threads(self, pagination: Any, filters: Any) -> CLPaginatedResponse:
-        """
-        List threads for a user (React UI sidebar).
-        filters.userId can be:
-          - Mongo ObjectId string (_id of user doc), OR
-          - user identifier string
-        """
         user_id = getattr(filters, "userId", None)
         chat_profile = getattr(filters, "chat_profile", None)
 
@@ -434,9 +455,6 @@ class MongoDataLayer(BaseDataLayer):
         return CLPaginatedResponse(data=items, total=total, page=page_number, size=limit)
 
     async def get_thread(self, thread_id: str, user_identifier: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """
-        Get one thread + steps (React UI opens a chat).
-        """
         query: Dict[str, Any] = {"id": thread_id}
         if user_identifier:
             query["userIdentifier"] = _safe_lower(user_identifier)
@@ -481,7 +499,6 @@ class MongoDataLayer(BaseDataLayer):
         if chat_profile is not None:
             patch["chat_profile"] = chat_profile
 
-        # Keep userIdentifier separate; do not touch name.
         if user_identifier is not None:
             patch["userIdentifier"] = _safe_lower(user_identifier)
 
