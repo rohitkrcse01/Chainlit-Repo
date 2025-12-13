@@ -48,6 +48,43 @@ def _safe_lower(s: Optional[str]) -> Optional[str]:
     return s.lower() if isinstance(s, str) else s
 
 
+def _derive_thread_name_from_step(step: Dict[str, Any], max_len: int = 80) -> str:
+    """
+    Thread 'name' should be the user message (as per your requirement).
+    We try common fields used by Chainlit/React payloads.
+
+    Priority:
+      1) step["threadName"] or step["name"] if explicitly provided by UI
+      2) user message text: input/content/text/message.content/output
+      3) fallback: "New Chat"
+    """
+    # If UI explicitly sends a thread name, prefer it
+    explicit = step.get("threadName") or step.get("thread_title") or step.get("name")
+    if isinstance(explicit, str) and explicit.strip():
+        title = " ".join(explicit.strip().split())
+        return title[:max_len]
+
+    candidates: List[Any] = []
+
+    # Most common
+    candidates.append(step.get("input"))
+    candidates.append(step.get("content"))
+    candidates.append(step.get("text"))
+    candidates.append(step.get("output"))
+
+    # Sometimes nested
+    msg = step.get("message")
+    if isinstance(msg, dict):
+        candidates.insert(0, msg.get("content"))
+
+    for c in candidates:
+        if isinstance(c, str) and c.strip():
+            clean = " ".join(c.strip().split())
+            return clean[:max_len]
+
+    return "New Chat"
+
+
 # Expose 'id' on cl.User using the Mongo _id if present
 setattr(cl.User, "id", property(lambda self: self.metadata.get("_id", self.identifier)))
 
@@ -76,6 +113,8 @@ class MongoDataLayer(BaseDataLayer):
     Behavior:
       - Thread is created ONLY when the first USER message arrives (create_step).
       - Deleting a thread cascades deletion of related steps/elements/feedback.
+      - Thread `name` is set from the first user message (not "Untitled").
+      - session_id is stored as UUID (never user_id).
     """
 
     def __init__(self, uri: str, db_name: str):
@@ -175,7 +214,6 @@ class MongoDataLayer(BaseDataLayer):
     async def get_element(self, element_id: str) -> Optional[Dict[str, Any]]:
         """
         Fetch a single element by its id.
-        This is the method Chainlit (and your UI) may need for attachments.
         """
         doc = await self.col_elements.find_one({"id": element_id})
         return _encode_doc(doc)
@@ -192,6 +230,8 @@ class MongoDataLayer(BaseDataLayer):
         - Always insert the step
         - Create/update thread ONLY when step is a user message
         - Normalize thread_id -> threadId
+        - Thread name is derived from FIRST user message
+        - session_id is UUID (not user_id)
         """
         logger.info(f"Creating step - step_dict={step_dict}")
 
@@ -200,6 +240,13 @@ class MongoDataLayer(BaseDataLayer):
         # Normalize userIdentifier to lowercase if present
         if step.get("userIdentifier"):
             step["userIdentifier"] = step["userIdentifier"].lower()
+
+        # session_id should be UUID, never user_id
+        # If UI passes session_id, keep it; otherwise generate.
+        session_id = step.get("session_id") or step.get("sessionId")
+        if not session_id:
+            session_id = str(uuid.uuid4())
+        step["session_id"] = str(session_id)
 
         # Ensure step id / timestamps
         step.setdefault("id", str(uuid.uuid4()))
@@ -223,14 +270,23 @@ class MongoDataLayer(BaseDataLayer):
         if not tid:
             return step["id"]
 
-        # Normalize threadId in step
-        await self.col_steps.update_one({"id": step["id"]}, {"$set": {"threadId": tid}})
-        if "thread_id" in step:
-            del step["thread_id"]
+        # Normalize threadId in step (DB consistency)
+        await self.col_steps.update_one({"id": step["id"]}, {"$set": {"threadId": tid, "session_id": step["session_id"]}})
+
+        # Thread name MUST be user message (not Untitled)
+        thread_name = _derive_thread_name_from_step(step)
 
         patch: Dict[str, Any] = {
-            "$setOnInsert": {"id": tid, "created_at": _now(), "name": "Untitled"},
-            "$set": {"updated_at": _now()},
+            "$setOnInsert": {
+                "id": tid,
+                "created_at": _now(),
+                "name": thread_name,       # ✅ user message as thread title
+                "session_id": step["session_id"],  # ✅ UUID session id
+            },
+            "$set": {
+                "updated_at": _now(),
+                "session_id": step["session_id"],  # keep latest session_id
+            },
         }
 
         # Persist userIdentifier consistently (try session if missing)
@@ -251,6 +307,12 @@ class MongoDataLayer(BaseDataLayer):
         if step.get("chat_profile"):
             patch["$set"]["chat_profile"] = step["chat_profile"]
 
+        # If thread already exists AND name is empty/Untitled, set it from first user message.
+        # (Does not change your flow; it just fixes bad existing titles.)
+        existing = await self.col_threads.find_one({"id": tid}, {"name": 1})
+        if existing and (not existing.get("name") or existing.get("name") == "Untitled"):
+            patch["$set"]["name"] = thread_name
+
         await self.col_threads.update_one({"id": tid}, patch, upsert=True)
         logger.info(f"Thread created/updated for user message - tid={tid}")
 
@@ -269,6 +331,11 @@ class MongoDataLayer(BaseDataLayer):
         if "thread_id" in step and "threadId" not in step:
             step["threadId"] = step["thread_id"]
             del step["thread_id"]
+
+        # Ensure session_id stays UUID if provided, else do not overwrite
+        if step.get("sessionId") and not step.get("session_id"):
+            step["session_id"] = str(step["sessionId"])
+            del step["sessionId"]
 
         res = await self.col_steps.update_one({"id": step["id"]}, {"$set": step})
         return res.matched_count == 1
@@ -352,7 +419,9 @@ class MongoDataLayer(BaseDataLayer):
 
     def _prepare_thread_item(self, it: Dict[str, Any]) -> Dict[str, Any]:
         it = dict(it)
-        it.setdefault("name", "Untitled")
+
+        # Keep existing stored name (should be user message now)
+        it.setdefault("name", "New Chat")
         it.setdefault("created_at", _now())
         it.setdefault("updated_at", _now())
 
@@ -426,7 +495,7 @@ class MongoDataLayer(BaseDataLayer):
         self,
         thread_id: str,
         name: Optional[str] = None,
-        user_id: Optional[str] = None,
+        user_id: Optional[str] = None,  # kept for signature compatibility; not used for session_id
         metadata: Optional[Dict[str, Any]] = None,
         tags: Optional[List[str]] = None,
         user_identifier: Optional[str] = None,
@@ -446,8 +515,6 @@ class MongoDataLayer(BaseDataLayer):
         if user_identifier is not None:
             patch["userIdentifier"] = _safe_lower(user_identifier)
 
-        if user_id is not None:
-            patch["user_id"] = user_id
-
+        # Do NOT use user_id for session. session_id is handled in create_step.
         res = await self.col_threads.update_one({"id": thread_id}, {"$set": patch}, upsert=False)
         return res.matched_count == 1
