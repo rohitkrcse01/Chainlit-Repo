@@ -48,6 +48,17 @@ def _safe_lower(s: Optional[str]) -> Optional[str]:
     return s.lower() if isinstance(s, str) else s
 
 
+def _get_filter_value(filters: Any, key: str) -> Any:
+    """
+    Support both object-like filters (Chainlit) and dict-like filters (custom API).
+    """
+    if filters is None:
+        return None
+    if isinstance(filters, dict):
+        return filters.get(key)
+    return getattr(filters, key, None)
+
+
 # Expose 'id' on cl.User using the Mongo _id if present
 setattr(cl.User, "id", property(lambda self: self.metadata.get("_id", self.identifier)))
 
@@ -160,7 +171,7 @@ class MongoDataLayer(BaseDataLayer):
         element.setdefault("created_at", _now())
         element.setdefault("updated_at", _now())
 
-        # Normalize thread field name
+        # Normalize thread field name BEFORE saving
         if "threadId" not in element and "thread_id" in element:
             element["threadId"] = element["thread_id"]
             del element["thread_id"]
@@ -175,7 +186,6 @@ class MongoDataLayer(BaseDataLayer):
     async def get_element(self, element_id: str) -> Optional[Dict[str, Any]]:
         """
         Fetch a single element by its id.
-        This is the method Chainlit (and your UI) may need for attachments.
         """
         doc = await self.col_elements.find_one({"id": element_id})
         return _encode_doc(doc)
@@ -188,27 +198,38 @@ class MongoDataLayer(BaseDataLayer):
 
     async def create_step(self, step_dict: Dict[str, Any]) -> str:
         """
-        Screenshot-aligned behavior:
-        - Always insert the step
-        - Create/update thread ONLY when step is a user message
-        - Normalize thread_id -> threadId
+        Screenshot-aligned behavior (but production-safe):
+        - Normalize thread_id -> threadId BEFORE saving (prevents mixed schema)
+        - Upsert step by 'id' (prevents duplicates)
+        - Thread is created/updated ONLY when step is a user message
         """
         logger.info(f"Creating step - step_dict={step_dict}")
 
         step = dict(step_dict)
-
-        # Normalize userIdentifier to lowercase if present
-        if step.get("userIdentifier"):
-            step["userIdentifier"] = step["userIdentifier"].lower()
 
         # Ensure step id / timestamps
         step.setdefault("id", str(uuid.uuid4()))
         step.setdefault("created_at", _now())
         step.setdefault("updated_at", _now())
 
-        # Insert step first
-        await self.col_steps.insert_one(step)
-        logger.info(f"Step created - id={step['id']}, type={step.get('type')}")
+        # Normalize userIdentifier to lowercase if present
+        if step.get("userIdentifier"):
+            step["userIdentifier"] = step["userIdentifier"].lower()
+
+        # Normalize threadId BEFORE saving (fix mixed schema)
+        tid = step.get("threadId") or step.get("thread_id")
+        if tid:
+            step["threadId"] = tid
+        if "thread_id" in step:
+            del step["thread_id"]
+
+        # Persist step (UPSERT to avoid duplicates / retries)
+        await self.col_steps.update_one(
+            {"id": step["id"]},
+            {"$setOnInsert": step},
+            upsert=True,
+        )
+        logger.info(f"Step upserted - id={step['id']}, type={step.get('type')}")
 
         # Only create thread when user sends first message
         step_type = (step.get("type") or "")
@@ -218,22 +239,19 @@ class MongoDataLayer(BaseDataLayer):
             logger.info(f"Thread creation skipped for non-user message - type={step_type}")
             return step["id"]
 
-        # Extract thread id
-        tid = step.get("thread_id") or step.get("threadId")
         if not tid:
             return step["id"]
-
-        # Normalize threadId in step
-        await self.col_steps.update_one({"id": step["id"]}, {"$set": {"threadId": tid}})
-        if "thread_id" in step:
-            del step["thread_id"]
 
         patch: Dict[str, Any] = {
             "$setOnInsert": {"id": tid, "created_at": _now(), "name": "Untitled"},
             "$set": {"updated_at": _now()},
         }
 
-        # Persist userIdentifier consistently (try session if missing)
+        # Persist user_id if provided (legacy)
+        if step.get("user_id"):
+            patch["$set"]["user_id"] = step["user_id"]
+
+        # Persist userIdentifier consistently (try Chainlit session if missing)
         user_identifier = step.get("userIdentifier")
         if not user_identifier:
             try:
@@ -287,10 +305,10 @@ class MongoDataLayer(BaseDataLayer):
     async def delete_thread(self, thread_id: str) -> bool:
         """
         Cascade delete everything related to a thread:
-          - steps
-          - elements
-          - feedback
-          - thread itself
+          - steps (threadId + legacy thread_id)
+          - elements (threadId + legacy thread_id)
+          - feedback (threadId + forId)
+          - thread
         """
         # Gather step ids (for feedback deletion by forId)
         step_ids: List[str] = []
@@ -299,24 +317,30 @@ class MongoDataLayer(BaseDataLayer):
             if s.get("id"):
                 step_ids.append(s["id"])
 
+        # Delete feedback by threadId
         fb_by_thread = await self.col_feedback.delete_many({"threadId": thread_id})
 
+        # Delete feedback by forId
         fb_by_forid = None
         if step_ids:
             fb_by_forid = await self.col_feedback.delete_many({"forId": {"$in": step_ids}})
 
-        el = await self.col_elements.delete_many({"threadId": thread_id})
+        # Delete elements (support legacy thread_id too)
+        el1 = await self.col_elements.delete_many({"threadId": thread_id})
+        el2 = await self.col_elements.delete_many({"thread_id": thread_id})
 
+        # Delete steps (support legacy thread_id too)
         st1 = await self.col_steps.delete_many({"threadId": thread_id})
         st2 = await self.col_steps.delete_many({"thread_id": thread_id})
 
+        # Delete thread
         th = await self.col_threads.delete_one({"id": thread_id})
 
         logger.info(
             "delete_thread cascade: "
             f"thread={th.deleted_count}, steps(threadId)={st1.deleted_count}, steps(thread_id)={st2.deleted_count}, "
-            f"elements={el.deleted_count}, feedback_by_thread={fb_by_thread.deleted_count}, "
-            f"feedback_by_forId={(fb_by_forid.deleted_count if fb_by_forid else 0)}"
+            f"elements(threadId)={el1.deleted_count}, elements(thread_id)={el2.deleted_count}, "
+            f"feedback_by_thread={fb_by_thread.deleted_count}, feedback_by_forId={(fb_by_forid.deleted_count if fb_by_forid else 0)}"
         )
 
         return th.deleted_count == 1
@@ -365,8 +389,8 @@ class MongoDataLayer(BaseDataLayer):
         return _encode_doc(it)
 
     async def list_threads(self, pagination: Any, filters: Any) -> CLPaginatedResponse:
-        user_id = getattr(filters, "userId", None)
-        chat_profile = getattr(filters, "chat_profile", None)
+        user_id = _get_filter_value(filters, "userId")
+        chat_profile = _get_filter_value(filters, "chat_profile")
 
         user_doc = None
         if isinstance(user_id, str) and ObjectId.is_valid(user_id):
