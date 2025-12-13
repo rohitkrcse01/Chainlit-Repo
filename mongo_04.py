@@ -74,7 +74,7 @@ class MongoDataLayer(BaseDataLayer):
       - feedback
 
     Behavior:
-      - Thread is created ONLY when the first USER message arrives (create_step logic).
+      - Thread is created ONLY when the first USER message arrives (create_step).
       - Deleting a thread cascades deletion of related steps/elements/feedback.
     """
 
@@ -97,20 +97,6 @@ class MongoDataLayer(BaseDataLayer):
 
     def build_debug_url(self, thread_id: str) -> str:
         return f"mongodb://debug/thread/{thread_id}"
-
-    async def ensure_indexes(self) -> None:
-        """
-        Optional: Call once at startup.
-        """
-        await self.col_users.create_index("identifier", unique=True)
-        await self.col_threads.create_index([("userIdentifier", 1), ("updated_at", -1)])
-        await self.col_threads.create_index("chat_profile")
-        await self.col_steps.create_index([("threadId", 1), ("created_at", 1)])
-        await self.col_steps.create_index("id", unique=True)
-        await self.col_elements.create_index("threadId")
-        await self.col_feedback.create_index("threadId")
-        await self.col_feedback.create_index("forId")
-        logger.info("MongoDB indexes ensured (no sessions).")
 
     # ---------------- Users ----------------
 
@@ -166,12 +152,15 @@ class MongoDataLayer(BaseDataLayer):
     # ---------------- Elements ----------------
 
     async def create_element(self, element_dict: Dict[str, Any]) -> str:
+        """
+        Persist attachments / UI elements linked to a thread and/or step.
+        """
         element = dict(element_dict)
         element.setdefault("id", str(uuid.uuid4()))
         element.setdefault("created_at", _now())
         element.setdefault("updated_at", _now())
 
-        # normalize thread field name
+        # Normalize thread field name
         if "threadId" not in element and "thread_id" in element:
             element["threadId"] = element["thread_id"]
             del element["thread_id"]
@@ -186,45 +175,10 @@ class MongoDataLayer(BaseDataLayer):
     async def get_element(self, element_id: str) -> Optional[Dict[str, Any]]:
         """
         Fetch a single element by its id.
-        Useful if your UI wants to open/download a stored attachment.
+        This is the method Chainlit (and your UI) may need for attachments.
         """
         doc = await self.col_elements.find_one({"id": element_id})
         return _encode_doc(doc)
-
-    async def get_elements(
-        self,
-        thread_id: Optional[str] = None,
-        step_id: Optional[str] = None,
-        pagination: Optional[Any] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        Fetch elements by threadId and/or stepId.
-
-        - If thread_id is provided: returns elements for that thread.
-        - If step_id is provided: returns elements for that step.
-        - If both provided: returns elements matching both.
-        - Pagination supported if you pass an object with offset/first or page/size.
-        """
-        query: Dict[str, Any] = {}
-
-        if thread_id:
-            query["threadId"] = thread_id
-        if step_id:
-            # Chainlit commonly uses forId for linking element to step
-            # but some apps store stepId directly. We support both.
-            query["$or"] = [{"forId": step_id}, {"stepId": step_id}]
-
-        skip, limit = self._calculate_pagination(pagination) if pagination else (0, 500)
-
-        cursor = (
-            self.col_elements.find(query)
-            .sort("created_at", 1)
-            .skip(skip)
-            .limit(limit)
-        )
-
-        docs = await cursor.to_list(length=limit)
-        return [_encode_doc(d) for d in docs]
 
     async def delete_element(self, element_id: str) -> bool:
         res = await self.col_elements.delete_one({"id": element_id})
@@ -233,6 +187,12 @@ class MongoDataLayer(BaseDataLayer):
     # ---------------- Steps (messages) ----------------
 
     async def create_step(self, step_dict: Dict[str, Any]) -> str:
+        """
+        Screenshot-aligned behavior:
+        - Always insert the step
+        - Create/update thread ONLY when step is a user message
+        - Normalize thread_id -> threadId
+        """
         logger.info(f"Creating step - step_dict={step_dict}")
 
         step = dict(step_dict)
@@ -241,15 +201,12 @@ class MongoDataLayer(BaseDataLayer):
         if step.get("userIdentifier"):
             step["userIdentifier"] = step["userIdentifier"].lower()
 
-        # Ensure step id / created_at
-        if "id" not in step:
-            step["id"] = str(uuid.uuid4())
-        if not step.get("created_at"):
-            step["created_at"] = _now()
-        if not step.get("updated_at"):
-            step["updated_at"] = _now()
+        # Ensure step id / timestamps
+        step.setdefault("id", str(uuid.uuid4()))
+        step.setdefault("created_at", _now())
+        step.setdefault("updated_at", _now())
 
-        # Persist step
+        # Insert step first
         await self.col_steps.insert_one(step)
         logger.info(f"Step created - id={step['id']}, type={step.get('type')}")
 
@@ -257,32 +214,24 @@ class MongoDataLayer(BaseDataLayer):
         step_type = (step.get("type") or "")
         is_user_message = step_type in ["user_message", "message"]
 
-        # Skip thread creation for non-user messages
         if not is_user_message:
             logger.info(f"Thread creation skipped for non-user message - type={step_type}")
             return step["id"]
 
-        # Ensure thread id exists (thread_id or threadId)
+        # Extract thread id
         tid = step.get("thread_id") or step.get("threadId")
         if not tid:
             return step["id"]
 
-        # Normalize threadId for consistent schema - always use threadId
-        step["threadId"] = tid
+        # Normalize threadId in step
+        await self.col_steps.update_one({"id": step["id"]}, {"$set": {"threadId": tid}})
         if "thread_id" in step:
             del step["thread_id"]
-
-        # Update stored step with consistent threadId
-        await self.col_steps.update_one({"id": step["id"]}, {"$set": {"threadId": tid}})
 
         patch: Dict[str, Any] = {
             "$setOnInsert": {"id": tid, "created_at": _now(), "name": "Untitled"},
             "$set": {"updated_at": _now()},
         }
-
-        # Persist user_id if provided (legacy)
-        if step.get("user_id"):
-            patch["$set"]["user_id"] = step["user_id"]
 
         # Persist userIdentifier consistently (try session if missing)
         user_identifier = step.get("userIdentifier")
@@ -292,13 +241,13 @@ class MongoDataLayer(BaseDataLayer):
                     u = cl.user_session.get("user")
                     user_identifier = getattr(u, "identifier", u) if u else None
             except Exception as e:
-                logger.debug(f"Could not get user from Chainlit session (normal for FastAPI calls): {e}")
+                logger.debug(f"Could not get user from Chainlit session: {e}")
                 user_identifier = None
 
         if user_identifier:
             patch["$set"]["userIdentifier"] = str(user_identifier).lower()
 
-        # Persist chat_profile if present on step (optional)
+        # Optional chat_profile
         if step.get("chat_profile"):
             patch["$set"]["chat_profile"] = step["chat_profile"]
 
@@ -314,9 +263,9 @@ class MongoDataLayer(BaseDataLayer):
 
         step["updated_at"] = _now()
 
-        # normalize
         if step.get("userIdentifier"):
             step["userIdentifier"] = step["userIdentifier"].lower()
+
         if "thread_id" in step and "threadId" not in step:
             step["threadId"] = step["thread_id"]
             del step["thread_id"]
@@ -343,29 +292,24 @@ class MongoDataLayer(BaseDataLayer):
           - feedback
           - thread itself
         """
-        # Gather step ids to delete feedback by forId
+        # Gather step ids (for feedback deletion by forId)
         step_ids: List[str] = []
         cursor = self.col_steps.find({"threadId": thread_id}, {"id": 1})
         async for s in cursor:
             if s.get("id"):
                 step_ids.append(s["id"])
 
-        # Delete feedback by threadId
         fb_by_thread = await self.col_feedback.delete_many({"threadId": thread_id})
 
-        # Delete feedback by forId (linked to step ids)
         fb_by_forid = None
         if step_ids:
             fb_by_forid = await self.col_feedback.delete_many({"forId": {"$in": step_ids}})
 
-        # Delete elements
         el = await self.col_elements.delete_many({"threadId": thread_id})
 
-        # Delete steps (both new + legacy field)
         st1 = await self.col_steps.delete_many({"threadId": thread_id})
         st2 = await self.col_steps.delete_many({"thread_id": thread_id})
 
-        # Delete thread
         th = await self.col_threads.delete_one({"id": thread_id})
 
         logger.info(
