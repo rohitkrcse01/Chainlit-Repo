@@ -144,7 +144,7 @@ class MongoDataLayer(BaseDataLayer):
             "identifier": identifier,
             "metadata": user.metadata or {},
             "created_at": _now(),
-            "updated_at": _now(),
+            
         }
 
         try:
