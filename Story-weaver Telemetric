@@ -1,1 +1,20 @@
 
+label_replace(
+  count(sum by (employee_id)(increase(api_requests_total[1w] offset 0w)) > 0),
+  "week","W0","__name__",".*"
+)
+OR
+label_replace(
+  count(sum by (employee_id)(increase(api_requests_total[1w] offset 1w)) > 0),
+  "week","W1","__name__",".*"
+)
+OR
+label_replace(
+  count(sum by (employee_id)(increase(api_requests_total[1w] offset 2w)) > 0),
+  "week","W2","__name__",".*"
+)
+OR
+label_replace(
+  count(sum by (employee_id)(increase(api_requests_total[1w] offset 3w)) > 0),
+  "week","W3","__name__",".*"
+)
